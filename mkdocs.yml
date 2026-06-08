@@ -69,6 +69,8 @@ nav:
   - trace-run: commands/trace-run.md
   - version: commands/version.md
   - vmmap: commands/vmmap.md
+  - wine-break: commands/wine-break.md
+  - wine-symbols: commands/wine-symbols.md
   - xfiles: commands/xfiles.md
   - xinfo: commands/xinfo.md
   - xor-memory: commands/xor-memory.md

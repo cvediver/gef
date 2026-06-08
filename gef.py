@@ -57,6 +57,7 @@ import binascii
 import codecs
 import collections
 import configparser
+import contextlib
 import ctypes
 import enum
 import functools
@@ -1431,6 +1432,59 @@ class Shdr:
             f"addr={self.sh_addr:#x}, offset={self.sh_offset}, size={self.sh_size}, link={self.sh_link}, "
             f"info={self.sh_info}, addralign={self.sh_addralign}, entsize={self.sh_entsize})"
         )
+
+
+class MinimalPe:
+    """Minimal PE/COFF header reader. Just enough to extract the preferred image
+    base and entry-point RVA so that Wine-mapped images can be symbolicated. Not
+    a `FileFormat` because GEF cannot natively debug PE binaries; this is purely
+    a helper for `wine-break` / `wine-symbols`."""
+
+    DOS_MAGIC  = 0x5A4D  # 'MZ'
+    NT_MAGIC   = 0x00004550  # 'PE\0\0'
+    OPT_PE32   = 0x10B
+    OPT_PE32P  = 0x20B
+
+    path: pathlib.Path
+    is_64bit: bool
+    entry_rva: int
+    image_base: int
+
+    def __init__(self, path: str | pathlib.Path) -> None:
+        self.path = pathlib.Path(path).expanduser()
+        with self.path.open("rb") as fd:
+            if struct.unpack("<H", fd.read(2))[0] != MinimalPe.DOS_MAGIC:
+                raise ValueError("Not a PE file (bad DOS magic)")
+            fd.seek(0x3C)
+            e_lfanew = struct.unpack("<I", fd.read(4))[0]
+            fd.seek(e_lfanew)
+            if struct.unpack("<I", fd.read(4))[0] != MinimalPe.NT_MAGIC:
+                raise ValueError("Not a PE file (bad NT magic)")
+            fd.seek(e_lfanew + 4 + 20)  # skip COFF file header
+            magic = struct.unpack("<H", fd.read(2))[0]
+            self.is_64bit = magic == MinimalPe.OPT_PE32P
+            if magic not in (MinimalPe.OPT_PE32, MinimalPe.OPT_PE32P):
+                raise ValueError(f"Unknown optional-header magic {magic:#x}")
+            fd.seek(e_lfanew + 4 + 20 + 16)
+            self.entry_rva = struct.unpack("<I", fd.read(4))[0]
+            if self.is_64bit:
+                fd.seek(e_lfanew + 4 + 20 + 24)
+                self.image_base = struct.unpack("<Q", fd.read(8))[0]
+            else:
+                fd.seek(e_lfanew + 4 + 20 + 28)
+                self.image_base = struct.unpack("<I", fd.read(4))[0]
+        return
+
+    @classmethod
+    def is_valid(cls, path: pathlib.Path) -> bool:
+        try:
+            with path.open("rb") as fd:
+                return struct.unpack("<H", fd.read(2))[0] == cls.DOS_MAGIC
+        except (OSError, struct.error):
+            return False
+
+    def __str__(self) -> str:
+        return f"PE('{self.path}', base={self.image_base:#x}, entry_rva={self.entry_rva:#x})"
 
 
 class Instruction:
@@ -5210,6 +5264,77 @@ class NamedBreakpoint(gdb.Breakpoint):
         return True
 
 
+class WineLoaderBreakpoint(gdb.Breakpoint):
+    """Pending breakpoint on Wine's `signal_start_thread` (ntdll.so). When hit, the
+    target PE has been mapped: locate its base in vmmap, load its symbols with the
+    correct slide, then arm a temporary breakpoint on the PE entry point (or `main`
+    when available)."""
+
+    def __init__(self, pe_path: pathlib.Path, sync_symbol: str, break_main: bool) -> None:
+        super().__init__(spec=sync_symbol, type=gdb.BP_BREAKPOINT, internal=True, temporary=True)
+        self.silent = True
+        self.pe_path = pe_path
+        self.break_main = break_main
+        self.fired = False
+        return
+
+    def stop(self) -> bool:
+        # `signal_start_thread` runs once per Wine thread; a temporary bp whose
+        # stop() returns False is not auto-deleted, so guard explicitly.
+        if self.fired:
+            return False
+        self.fired = True
+        self.enabled = False
+        reset_all_caches()
+        # Locate the PE image base (lowest file-backed mapping at offset 0)
+        target = str(self.pe_path)
+        base: int | None = None
+        for sect in gef.memory.maps:
+            if sect.path == target and sect.offset == 0:
+                base = sect.page_start
+                break
+        if base is None:
+            cands = [s.page_start for s in gef.memory.maps if s.path == target]
+            base = min(cands) if cands else None
+        if base is None:
+            warn(f"PE '{target}' not found in process maps; stopping here")
+            return True
+
+        try:
+            pe = MinimalPe(self.pe_path)
+        except (OSError, ValueError) as e:
+            warn(f"Failed to parse PE header of '{target}': {e}")
+            return True
+
+        slide = base - pe.image_base
+        # Load the target's own symbol table now so that `main` (if any) is
+        # resolvable for the entry breakpoint below. The Wine builtin DLLs
+        # are not mapped yet at this point; they get picked up by the
+        # `wine-symbols` pass in WineEntryBreakpoint.
+        with WineSymbolsCommand.objfile_handler_suspended():
+            gdb.execute(f"add-symbol-file {target} -o {slide:#x}", to_string=True)
+        ok(f"Loaded symbols for {self.pe_path.name} @ {base:#x} (slide={slide:#x})")
+
+        entry = base + pe.entry_rva
+        if self.break_main and gdb.lookup_global_symbol("main"):
+            info("Breaking at PE 'main'")
+            WineEntryBreakpoint("main")
+            return False
+        info(f"Breaking at PE entry-point: {entry:#x}")
+        WineEntryBreakpoint(f"*{entry:#x}")
+        return False
+
+
+class WineEntryBreakpoint(EntryBreakBreakpoint):
+    """Final stop inside the PE: now that the Wine PE-side loader has mapped
+    every dependent DLL, register their symbol files so backtraces resolve."""
+
+    def stop(self) -> bool:
+        reset_all_caches()
+        gdb.execute("wine-symbols --quiet", to_string=True)
+        return super().stop()
+
+
 class JustSilentStopBreakpoint(gdb.Breakpoint):
     """When hit, this temporary breakpoint stop the execution."""
 
@@ -8578,6 +8703,149 @@ class EntryPointBreakCommand(GenericCommand):
         vmmap = gef.memory.maps
         base_address = [x.page_start for x in vmmap if x.path == get_filepath()][0]
         return self.set_init_tbreak(base_address + addr)
+
+
+@register
+class WineBreakCommand(GenericCommand):
+    """Run a PE executable under Wine and stop on its entry point. A pending
+    breakpoint is armed on Wine's `signal_start_thread` (exported by `ntdll.so`,
+    where the target image is guaranteed to be mapped); once hit, the PE base is
+    located in the process maps, its symbols are loaded with the correct slide,
+    and execution continues to `main` (or the raw COFF entry if no `main`).
+
+    Unlike the legacy approach of chaining breakpoints through Wine internals
+    (`wld_start`, `wine_init`, ...) this requires no Wine debug build and works
+    on any Wine that exports `signal_start_thread` from the unix-side ntdll.so
+    (Wine 6.x+)."""
+
+    _cmdline_ = "wine-break"
+    _syntax_  = f"{_cmdline_} EXECUTABLE.exe [ARGS ...]"
+    _aliases_ = ["wstart",]
+    _example_ = f"{_cmdline_} ./target.exe -flag value"
+
+    def __init__(self) -> None:
+        super().__init__(complete=gdb.COMPLETE_FILENAME)
+        self["wine_loader"]  = ("", "Path to the Wine loader (autodetected from $WINELOADER / PATH if empty)")
+        self["sync_symbol"]  = ("signal_start_thread", "Exported ntdll.so symbol used as the post-map sync point")
+        self["break_main"]   = (True, "Prefer breaking on `main` over the raw COFF entry point")
+        return
+
+    def find_wine_loader(self, is_64bit: bool) -> pathlib.Path | None:
+        override = self["wine_loader"]
+        names = ("wine64", "wine") if is_64bit else ("wine", "wine32", "wine64")
+        candidates: list[str | None] = [override or None, os.environ.get("WINELOADER")]
+        for name in names:
+            candidates.append(shutil.which(name))
+        for d in ("/usr/lib/wine", "/usr/lib64/wine", "/opt/wine-stable/bin",
+                  "/opt/wine-staging/bin", "/usr/local/lib/wine"):
+            for name in names:
+                candidates.append(os.path.join(d, name))
+        for cand in candidates:
+            if not cand:
+                continue
+            p = pathlib.Path(cand).resolve()
+            # Distros ship `wine` as a shell wrapper; only the real ELF loader
+            # is debuggable.
+            if p.is_file() and os.access(p, os.X_OK) and Elf.is_valid(p):
+                return p
+        return None
+
+    def do_invoke(self, argv: list[str]) -> None:
+        if not argv:
+            self.usage()
+            return
+
+        pe_path = pathlib.Path(argv[0]).expanduser().resolve()
+        if not pe_path.is_file():
+            err(f"No such file: '{pe_path}'")
+            return
+        if not MinimalPe.is_valid(pe_path):
+            err(f"'{pe_path}' is not a PE/COFF executable")
+            return
+        pe = MinimalPe(pe_path)
+
+        if is_alive():
+            warn("gdb is already running")
+            return
+
+        loader = self.find_wine_loader(pe.is_64bit)
+        if not loader:
+            err("Cannot locate a Wine loader; set `gef config wine-break.wine_loader /path/to/wine64`")
+            return
+
+        gdb.execute(f"file {loader}")
+        # Wine uses SIGUSR1 for inter-thread sync and may take guard-page faults
+        gdb.execute("handle SIGUSR1 nostop noprint pass")
+        gdb.execute("set breakpoint pending on")
+
+        info(f"Wine loader: {loader}")
+        info(f"PE target  : {pe_path}")
+        WineLoaderBreakpoint(pe_path, self["sync_symbol"], self["break_main"])
+        hide_context()
+        try:
+            extra = " ".join(argv[1:])
+            gdb.execute(f"run {pe_path} {extra}".rstrip())
+        finally:
+            unhide_context()
+        return
+
+
+@register
+class WineSymbolsCommand(GenericCommand):
+    """Locate every PE image mapped into the current (Wine) process and register
+    its symbol file with GDB at the correct slide, so that backtraces through
+    Wine builtin DLLs and the target executable resolve to source. Only images
+    backed by an on-disk PE/COFF file are considered."""
+
+    _cmdline_ = "wine-symbols"
+    _syntax_  = f"{_cmdline_} [--quiet]"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def objfile_handler_suspended() -> Generator[None, None, None]:
+        """GEF's new-objfile hook only understands the registered `FileFormat`s;
+        feeding it PE images via `add-symbol-file` just produces a stream of
+        'Not a valid ELF' warnings. Suspend it while we register PE objects."""
+        try:
+            gef_on_new_unhook(new_objfile_handler)
+            unhooked = True
+        except (SystemError, gdb.error):
+            unhooked = False
+        try:
+            yield
+        finally:
+            if unhooked:
+                gef_on_new_hook(new_objfile_handler)
+
+    @only_if_gdb_running
+    @parse_arguments({}, {"--quiet": False})
+    def do_invoke(self, _: list[str], **kwargs: Any) -> None:
+        args = kwargs["arguments"]
+        loaded = set(o.filename for o in gdb.objfiles() if o.filename)
+        seen: set[str] = set()
+        count = 0
+        with self.objfile_handler_suspended():
+            for sect in gef.memory.maps:
+                path = sect.path
+                if not path or path in seen or path in loaded or sect.offset != 0:
+                    continue
+                seen.add(path)
+                p = pathlib.Path(path)
+                if not p.is_file() or not MinimalPe.is_valid(p):
+                    continue
+                try:
+                    pe = MinimalPe(p)
+                except (OSError, ValueError):
+                    continue
+                slide = sect.page_start - pe.image_base
+                gdb.execute(f"add-symbol-file {path} -o {slide:#x}", to_string=True)
+                count += 1
+                if not args.quiet:
+                    ok(f"{p.name:<32s} @ {sect.page_start:#018x} (slide={slide:#x})")
+        if not args.quiet:
+            info(f"{count} PE image(s) registered")
+        reset_all_caches()
+        return
 
 
 @register
